@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scipy.optimize import linear_sum_assignment
-from typing import Dict
+from typing import Dict, List
 
 from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 
@@ -20,7 +20,8 @@ import numpy as np
 
 @register()
 class HungarianMatcher(nn.Module):
-    """This class computes an assignment between the targets and the predictions of the network
+    """This class computes an assignment between the targets and the predictions of the network.
+    It incorporates query specialization, where queries are pre-assigned to object category groups.
 
     For efficiency reasons, the targets don't include the no_object. Because of this, in general,
     there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
@@ -29,13 +30,30 @@ class HungarianMatcher(nn.Module):
 
     __share__ = ['use_focal_loss', ]
 
-    def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0):
+    def __init__(self, 
+                 weight_dict: Dict[str, float],
+                 num_queries: int = 300,
+                 num_classes: int = 80,
+                 specialization_groups: List[List[int]] = [
+                    list(range(0, 20)),
+                    list(range(20, 40)),
+                    list(range(40, 60)),
+                    list(range(60, 80)),
+                 ],
+                 use_focal_loss: bool = False, 
+                 alpha: float = 0.25, 
+                 gamma: float = 2.0):
         """Creates the matcher
 
         Params:
-            cost_class: This is the relative weight of the classification error in the matching cost
-            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
-            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+            weight_dict: Dict with keys 'cost_class', 'cost_bbox', 'cost_giou'
+            num_queries: Total number of queries used by the model.
+            num_classes: Number of object classes in the dataset.
+            specialization_groups: A list of lists, where each inner list contains class IDs 
+                                   belonging to one specialization group.
+            use_focal_loss: Whether to use Focal Loss for classification cost.
+            alpha: Alpha_param for Focal Loss.
+            gamma: Gamma_param for Focal Loss.
         """
         super().__init__()
         self.cost_class = weight_dict['cost_class']
@@ -47,6 +65,40 @@ class HungarianMatcher(nn.Module):
         self.gamma = gamma
 
         assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
+
+        self.num_queries = num_queries
+        self.num_classes = num_classes
+
+        if not specialization_groups:
+            raise ValueError("specialization_groups cannot be empty.") 
+        self.num_specialization_groups = len(specialization_groups)
+
+        self.register_buffer('coco_class_to_group_id', torch.full((num_classes,), -1, dtype=torch.long))
+        for group_idx, class_ids_in_group in enumerate(specialization_groups):
+            if not class_ids_in_group: 
+                raise ValueError(f"Specialization group {group_idx} is empty.") 
+            for class_id in class_ids_in_group:
+                if not (0 <= class_id < num_classes): 
+                    raise ValueError(
+                        f"Class ID {class_id} in specialization_groups is out of bounds "
+                        f"for num_classes {num_classes}. Expected 0 to {num_classes - 1}."
+                    ) 
+                if self.coco_class_to_group_id[class_id] != -1: 
+                    raise ValueError(
+                        f"Class ID {class_id} is assigned to multiple specialization groups. "
+                        f"Previous group: {self.coco_class_to_group_id[class_id]}, new group: {group_idx}."
+                    ) 
+                self.coco_class_to_group_id[class_id] = group_idx
+        
+        self.register_buffer('query_to_group_id', torch.zeros(num_queries, dtype=torch.long))
+        queries_per_group_base = num_queries // self.num_specialization_groups
+        remainder_queries = num_queries % self.num_specialization_groups
+        
+        current_query_start_idx = 0
+        for group_idx in range(self.num_specialization_groups):
+            num_queries_for_this_group = queries_per_group_base + (1 if group_idx < remainder_queries else 0)
+            self.query_to_group_id[current_query_start_idx : current_query_start_idx + num_queries_for_this_group] = group_idx
+            current_query_start_idx += num_queries_for_this_group
 
     @torch.no_grad()
     def forward(self, outputs: Dict[str, torch.Tensor], targets, return_topk=False):
@@ -69,7 +121,16 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
+        assert not return_topk
+
         bs, num_queries = outputs["pred_logits"].shape[:2]
+
+        # --- 쿼리 전문화: 입력 쿼리 수 검증 ---
+        if num_queries != self.num_queries:
+            raise ValueError(
+                f"Number of queries in model output ({num_queries}) does not match "
+                f"self.num_queries ({self.num_queries}) defined in matcher init."
+            )
 
         # We flatten to compute the cost matrices in a batch
         if self.use_focal_loss:
@@ -107,6 +168,21 @@ class HungarianMatcher(nn.Module):
         sizes = [len(v["boxes"]) for v in targets]
         # FIXME，RT-DETR, different way to set NaN
         C = torch.nan_to_num(C, nan=1.0)
+        
+        current_target_offset = 0
+        for i in range(bs):
+            num_gt_for_this_item = sizes[i]
+
+            target_labels_item = targets[i]["labels"].to(self.coco_class_to_group_id.device)
+            target_group_ids_item = self.coco_class_to_group_id[target_labels_item]
+
+            specialization_mask = self.query_to_group_id.unsqueeze(1) != target_group_ids_item.unsqueeze(0)
+
+            C_item_slice_to_mask = C[i, :, current_target_offset : current_target_offset + num_gt_for_this_item]
+            C_item_slice_to_mask[specialization_mask.cpu()] = np.inf
+
+            current_target_offset += num_gt_for_this_item
+
         indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
         indices = [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices_pre]
 
