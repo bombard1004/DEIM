@@ -154,6 +154,10 @@ class Mosaic(T.Transform):
         else:
             resized_images, resized_targets, max_height, max_width = self.load_samples_from_dataset(image, target,dataset)
             mosaic_image, mosaic_target = self.create_mosaic_from_dataset(resized_images, resized_targets, max_height, max_width)
+        
+        if len(mosaic_target['boxes']) > 75:
+            print(f"skipping mosaic, too many boxes: {len(mosaic_target['boxes'])}")
+            return image, target, dataset
 
         # Clamp boxes and convert target formats
         if 'boxes' in mosaic_target:

@@ -141,15 +141,19 @@ class BatchImageCollateFunction(BaseCollateFunction):
         if random.random() < self.mixup_prob and self.mixup_epochs[0] <= self.epoch < self.mixup_epochs[-1]:
             # Generate mixup ratio
             beta = round(random.uniform(0.45, 0.55), 6)
-
-            # Mix images
-            images = images.roll(shifts=1, dims=0).mul_(1.0 - beta).add_(images.mul(beta))
-
-            # Prepare targets for Mixup
+            shifted_images = images.roll(shifts=1, dims=0)
             shifted_targets = targets[-1:] + targets[:-1]
+
+            updated_images = images.clone()
             updated_targets = deepcopy(targets)
 
             for i in range(len(targets)):
+                if len(targets[i]['boxes']) + len(shifted_targets[i]['boxes']) > 75:
+                    print(f"DEBUG: Skipping Mixup for sample {i}: {len(targets[i]['boxes'])} + {len(shifted_targets[i]['boxes'])} > 75 boxes.")
+                    continue
+                
+                updated_images[i] = images[i] * beta + shifted_images[i] * (1.0 - beta)
+
                 # Combine boxes, labels, and areas from original and shifted targets
                 updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
                 updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
@@ -160,6 +164,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
                     [beta] * len(targets[i]['labels']) + [1.0 - beta] * len(shifted_targets[i]['labels']), 
                     dtype=torch.float32
                     )
+            images = updated_images
             targets = updated_targets
 
             if self.data_vis:

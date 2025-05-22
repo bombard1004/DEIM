@@ -168,22 +168,31 @@ class HungarianMatcher(nn.Module):
         sizes = [len(v["boxes"]) for v in targets]
         # FIXME，RT-DETR, different way to set NaN
         C = torch.nan_to_num(C, nan=1.0)
-        
-        current_target_offset = 0
-        for i in range(bs):
-            num_gt_for_this_item = sizes[i]
 
-            target_labels_item = targets[i]["labels"].to(self.coco_class_to_group_id.device)
-            target_group_ids_item = self.coco_class_to_group_id[target_labels_item]
+        C_eachs = [c[i] for i, c in enumerate(C.split(sizes, -1))]
 
+        indices_pre = []
+
+        for i in range(len(C_eachs)):
+            target_group_ids_item = self.coco_class_to_group_id[targets[i]["labels"]]
             specialization_mask = self.query_to_group_id.unsqueeze(1) != target_group_ids_item.unsqueeze(0)
 
-            C_item_slice_to_mask = C[i, :, current_target_offset : current_target_offset + num_gt_for_this_item]
-            C_item_slice_to_mask[specialization_mask.cpu()] = np.inf
+            C_eachs[i][specialization_mask] = np.inf
 
-            current_target_offset += num_gt_for_this_item
+            try:
+                ids = linear_sum_assignment(C_eachs[i])
+                indices_pre.append(ids)
+            except:
+                import sys
+                torch.set_printoptions(threshold=sys.maxsize)
+                print(f"sizes: {sizes}")
+                print(f"i: {i}")
+                print(f"c_each.shape: {C_eachs[i].shape}")
+                print(f"target_group_ids_item: {target_group_ids_item}")
+                print(f"specialization_mask: {specialization_mask}")
+                print(f"c_each: {C_eachs[i]}")
+                raise
 
-        indices_pre = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
         indices = [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices_pre]
 
         # Compute topk indices
